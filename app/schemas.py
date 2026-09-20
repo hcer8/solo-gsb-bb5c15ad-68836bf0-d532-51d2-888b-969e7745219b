@@ -664,3 +664,100 @@ class ConflictFragilityMapOut(BaseModel):
     intrinsic_self_risks: list[ConflictFragilitySelfRiskOut] = Field(
         description="命中风险等级的自二聚体（不参与连通性，按批次位置升序）"
     )
+
+
+class BatchSeriesRiskTrajectoriesRequest(BaseModel):
+    batch_ids: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description=(
+            "按时间先后排列的批次 ID（2～20 个，顺序即时间轴；不可重复）"
+        ),
+    )
+    continuous_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="统一连续互补长度阈值（对全部批次生效，1～200）",
+    )
+    three_prime_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="统一 3′端连续互补长度阈值（对全部批次生效，1～200）",
+    )
+
+    @field_validator("batch_ids")
+    @classmethod
+    def _batch_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for value in values:
+            bid = value.strip()
+            if not bid:
+                bad.append(value)
+            else:
+                normalized.append(bid)
+        if bad:
+            raise ValueError("批次 ID 不能为空")
+        return normalized
+
+
+class RiskTrajectorySegmentOut(BaseModel):
+    start_batch_index: int = Field(description="片段起始批次序号（0 起，含）")
+    end_batch_index: int = Field(description="片段结束批次序号（含）")
+    present: bool = Field(description="片段内配对是否存在（两端引物均在批次中）")
+    risk_level: str | None = Field(
+        description="present 片段为统一阈值下重判的 high/medium/low；absent 片段为 null"
+    )
+    sequence_changed_at_boundary: bool = Field(
+        description=(
+            "true 表示该片段起点批次相对前一批次发生同名引物序列变化"
+            "（即片段边界为序列变化边界；仅 present 片段可能为 true）"
+        )
+    )
+
+
+class RiskTrajectoryOut(BaseModel):
+    pair_key: str = Field(
+        description="稳定配对键：自二聚体为单名，异二聚体为按名称字典序的 A|B"
+    )
+    name_a: str = Field(description="配对键第一名称（异二聚体为字典序较小者）")
+    name_b: str = Field(description="配对键第二名称（自二聚体与 name_a 相同）")
+    is_self_dimer: bool
+    risk_changed: bool = Field(description="各 present 片段的风险等级是否发生过变化")
+    presence_changed: bool = Field(description="序列中是否出现过 absent")
+    sequence_changed: bool = Field(description="是否存在同名引物序列变化的片段边界")
+    segments: list[RiskTrajectorySegmentOut] = Field(
+        description=(
+            "最大连续片段（按批次序号升序、彼此衔接无缝覆盖 0..batch_count-1）："
+            "present/absent 翻转、风险等级变化、同名引物序列变化均为片段边界"
+        )
+    )
+
+
+class BatchTransitionOut(BaseModel):
+    index: int = Field(description="相邻批次对序号（0 起，对应 batch_ids[index]→下一个）")
+    escalated_count: int = Field(description="两批都存在且风险等级上升（low<medium<high）的配对数")
+    deescalated_count: int = Field(description="两批都存在且风险等级下降的配对数")
+    introduced_count: int = Field(description="前批 absent、本批 present 的配对数")
+    disappeared_count: int = Field(description="前批 present、本批 absent 的配对数")
+    sequence_changed_count: int = Field(
+        description="两批都存在的配对中，同名引物序列发生变化的配对数"
+    )
+
+
+class BatchSeriesRiskTrajectoriesOut(BaseModel):
+    batch_ids: list[str] = Field(description="请求给定的批次 ID（按时间顺序原样回显）")
+    batch_count: int
+    continuous_threshold: int = Field(description="本次重判使用的统一连续互补阈值")
+    three_prime_threshold: int = Field(description="本次重判使用的统一 3′端连续互补阈值")
+    pair_key_count: int = Field(description="全部批次中出现过的稳定配对键总数")
+    trajectory_count: int = Field(description="返回的有变化轨迹数")
+    transitions: list[BatchTransitionOut] = Field(
+        description="各相邻批次的变化汇总（按时间顺序，长度为 batch_count-1）"
+    )
+    trajectories: list[RiskTrajectoryOut] = Field(
+        description="仅含发生风险/存在性/序列变化的轨迹，按配对键升序"
+    )

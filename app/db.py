@@ -175,6 +175,32 @@ def get_pair_metrics(
     return [(r["max_complementary_run"], r["terminal_run"]) for r in rows]
 
 
+def get_named_pair_metrics(
+    conn: sqlite3.Connection, batch_id: str
+) -> list[tuple[str, str, bool, int, int]]:
+    """取跨批次轨迹所需字段：配对名、自二聚体标记与两个已保存标量指标。
+
+    每行 ``(name_top, name_bottom, is_self_dimer, 最长连续互补, 3′端连续互补)``，
+    按 pair_index 升序；不读取对齐行等其他字段。
+    """
+    rows = conn.execute(
+        "SELECT name_top, name_bottom, is_self_dimer, "
+        "max_complementary_run, terminal_run FROM pair_results "
+        "WHERE batch_id = ? ORDER BY pair_index",
+        (batch_id,),
+    ).fetchall()
+    return [
+        (
+            r["name_top"],
+            r["name_bottom"],
+            bool(r["is_self_dimer"]),
+            r["max_complementary_run"],
+            r["terminal_run"],
+        )
+        for r in rows
+    ]
+
+
 def list_batches(
     conn: sqlite3.Connection, limit: int, offset: int
 ) -> list[sqlite3.Row]:

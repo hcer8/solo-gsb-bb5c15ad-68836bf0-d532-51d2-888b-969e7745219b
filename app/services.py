@@ -7,13 +7,14 @@ import uuid
 
 from . import db
 from .augmentation import maximum_independent_set
-from .compare import PairDiff, compare_pair_risks
+from .compare import PairDiff, compare_pair_risks, pair_key
 from .dimer import PairResult, analyze_pair
 from .fragility import find_fragility
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
 from .repair import InfeasibleRepair, minimum_cost_removal
 from .threshold_map import build_threshold_map
+from .trajectory import build_trajectories, classify_risk, summarize_transitions
 
 
 class ConflictRepairProtectedError(ValueError):
@@ -926,4 +927,125 @@ def compare_batches(*, base_batch_id: str, target_batch_id: str) -> dict | None:
         "deescalated": [_diff_to_out(d) for d in result.deescalated],
         "introduced": [_diff_to_out(d) for d in result.introduced],
         "resolved": [_diff_to_out(d) for d in result.resolved],
+    }
+
+
+def build_batch_series_risk_trajectories(
+    *,
+    batch_ids: list[str],
+    continuous_threshold: int,
+    three_prime_threshold: int,
+) -> dict | None:
+    """跨批次风险轨迹（纯读，不重算对齐、不写库）。
+
+    对按时间排列、互不重复的 2～20 个批次，按引物名称构造稳定配对键，
+    仅用每个配对已落库的最长连续互补与 3′端连续互补两个标量，在请求
+    给定的统一阈值下重判风险（规则与批次计算一致）。对全部配对键逐批
+    形成 present/absent 序列并压缩为最大连续片段；同名引物序列变化
+    （仅在相邻两批都 present 时可判定）在片段边界标记。仅返回发生风险、
+    存在性或序列变化的轨迹，并汇总各相邻批次的升降、引入、消失数量。
+
+    任一批次不存在返回 None（由路由层转 404）；批次 ID 重复、数量越界
+    与阈值非法由请求模型/路由层拦截（422）。
+    """
+    n = len(batch_ids)
+
+    # 逐批读取引物（名称 -> 序列）与配对的两个已保存标量指标
+    primers_per_batch: list[dict[str, str]] = []
+    pairs_per_batch: list[list[tuple[str, str, bool, int, int]]] = []
+    with db.get_conn() as conn:
+        for batch_id in batch_ids:
+            batch = db.get_batch(conn, batch_id)
+            if batch is None:
+                return None
+            primers = db.get_primers(conn, batch_id)
+            pairs = db.get_named_pair_metrics(conn, batch_id)
+            primers_per_batch.append({r["name"]: r["sequence"] for r in primers})
+            pairs_per_batch.append(pairs)
+
+    # 全部批次中出现过的配对键并集（按名称元组，天然与提交顺序无关）
+    all_keys: set[tuple[str, str]] = set()
+    keyed_per_batch: list[dict[tuple[str, str], tuple[int, int]]] = []
+    for pairs in pairs_per_batch:
+        keyed: dict[tuple[str, str], tuple[int, int]] = {}
+        for top, bottom, is_self, c_run, t_run in pairs:
+            key = pair_key(top, bottom, is_self)
+            keyed[key] = (c_run, t_run)
+            all_keys.add(key)
+        keyed_per_batch.append(keyed)
+
+    # 逐批状态：present 时为统一阈值下重判的风险等级，absent 为 None。
+    # 自二聚体键 (name,name) 与异二聚体键都只依赖该批引物集合，故用
+    # “键两端名称均在本批引物中”判定存在性。
+    states: dict[tuple[str, str], list[str | None]] = {
+        key: [None] * n for key in all_keys
+    }
+    for i, keyed in enumerate(keyed_per_batch):
+        names = primers_per_batch[i]
+        for key in all_keys:
+            name_a, name_b = key
+            if name_a not in names or name_b not in names:
+                continue
+            c_run, t_run = keyed[key]
+            states[key][i] = classify_risk(
+                c_run,
+                t_run,
+                continuous_threshold=continuous_threshold,
+                three_prime_threshold=three_prime_threshold,
+            )
+
+    # 同名引物序列变化：仅在相邻两批配对都 present 时标记边界 (i, key)
+    sequence_changes: dict[tuple[int, tuple[str, str]], bool] = {}
+    for i in range(1, n):
+        prev_seqs, cur_seqs = primers_per_batch[i - 1], primers_per_batch[i]
+        for key in all_keys:
+            if states[key][i - 1] is None or states[key][i] is None:
+                continue
+            name_a, name_b = key
+            changed = (
+                prev_seqs.get(name_a) != cur_seqs.get(name_a)
+                or prev_seqs.get(name_b) != cur_seqs.get(name_b)
+            )
+            if changed:
+                sequence_changes[(i, key)] = True
+
+    trajectories = build_trajectories(
+        states, sequence_changes=sequence_changes
+    )
+    transitions = summarize_transitions(
+        states, sequence_changes=sequence_changes, batch_count=n
+    )
+
+    def _segment_out(seg) -> dict:
+        return {
+            "start_batch_index": seg.start,
+            "end_batch_index": seg.end,
+            "present": seg.present,
+            "risk_level": seg.risk_level,
+            "sequence_changed_at_boundary": seg.sequence_changed_at_boundary,
+        }
+
+    trajectories_out = [
+        {
+            "pair_key": trajectory.pair_key,
+            "name_a": trajectory.name_a,
+            "name_b": trajectory.name_b,
+            "is_self_dimer": trajectory.is_self_dimer,
+            "risk_changed": trajectory.risk_changed,
+            "presence_changed": trajectory.presence_changed,
+            "sequence_changed": trajectory.sequence_changed,
+            "segments": [_segment_out(seg) for seg in trajectory.segments],
+        }
+        for trajectory in trajectories
+    ]
+
+    return {
+        "batch_ids": batch_ids,
+        "batch_count": n,
+        "continuous_threshold": continuous_threshold,
+        "three_prime_threshold": three_prime_threshold,
+        "pair_key_count": len(all_keys),
+        "trajectory_count": len(trajectories_out),
+        "transitions": transitions,
+        "trajectories": trajectories_out,
     }

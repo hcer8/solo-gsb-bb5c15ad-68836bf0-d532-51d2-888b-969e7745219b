@@ -15,6 +15,8 @@ from .schemas import (
     BatchCreate,
     BatchList,
     BatchResult,
+    BatchSeriesRiskTrajectoriesOut,
+    BatchSeriesRiskTrajectoriesRequest,
     BatchSummary,
     ConflictFragilityMapOut,
     ConflictFragilityMapRequest,
@@ -33,6 +35,7 @@ from .schemas import (
 from .services import (
     ConflictRepairProtectedError,
     build_batch_conflict_fragility_map,
+    build_batch_series_risk_trajectories,
     build_batch_threshold_map,
     compare_batches,
     plan_batch_augmentation,
@@ -358,6 +361,37 @@ def create_threshold_map(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return ThresholdMapOut(**result)
+
+
+@app.post(
+    "/api/batch-series/risk-trajectories",
+    tags=["batches"],
+    summary="跨批次风险轨迹：统一阈值下用已保存长度重判、present/absent 片段压缩",
+    response_model=BatchSeriesRiskTrajectoriesOut,
+    responses={
+        404: {"description": "任一批次不存在"},
+        422: {"description": "批次数量越界、ID 重复/为空或阈值非法"},
+    },
+)
+def create_batch_series_risk_trajectories(
+    payload: BatchSeriesRiskTrajectoriesRequest,
+) -> BatchSeriesRiskTrajectoriesOut:
+    ids = payload.batch_ids
+    duplicates = sorted({bid for bid in ids if ids.count(bid) > 1})
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"批次 ID 重复: {', '.join(duplicates)}",
+        )
+
+    result = build_batch_series_risk_trajectories(
+        batch_ids=ids,
+        continuous_threshold=payload.continuous_threshold,
+        three_prime_threshold=payload.three_prime_threshold,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return BatchSeriesRiskTrajectoriesOut(**result)
 
 
 def _load_result(batch_id: str, *, risky_only: bool) -> BatchResult:

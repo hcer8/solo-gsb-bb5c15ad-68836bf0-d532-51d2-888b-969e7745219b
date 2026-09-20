@@ -27,7 +27,12 @@ low-link 一次遍历**识别全部割点引物（含移除后的连通分量数
 与桥配对（含两侧成员），命中等级的自二聚体不参与连通性、作为
 `intrinsic_self_risks` 单独返回（不重算对齐、不写库）；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
-对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
+对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）；
+通过 `POST /api/batch-series/risk-trajectories` 对 2～20 个**按时间排列**的批次，
+用一组**统一阈值**直接读取各批次配对已保存的两个互补长度**重判风险（不重算对齐）**，
+按引物名称生成稳定配对键，把每个配对键跨批次的 present/absent 序列**压缩为最大连续
+片段**（同名引物序列变化在片段边界标记），仅返回发生风险、存在性或序列变化的轨迹，
+并汇总各相邻批次的升降、引入、消失数量（全程只读）。
 
 ---
 
@@ -52,6 +57,7 @@ docker compose up --build -d
 | 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
 | 冲突图割点与桥 | `POST http://localhost:8000/api/batches/{id}/conflict-fragility-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
+| 跨批次风险轨迹 | `POST http://localhost:8000/api/batch-series/risk-trajectories` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
 > （容器路径 `/data/primer_dimer.db`）。镜像构建期安装依赖、容器启动期自动建库
@@ -750,6 +756,131 @@ curl -s http://localhost:8000/api/batches/f98cdd27-.../compare/3fa9c1e2-...
   `introduced_count = target_pair_count - common_pair_count`，
   `resolved_count = base_pair_count - common_pair_count`。
 
+### `POST /api/batch-series/risk-trajectories` — 跨批次风险轨迹（统一阈值重判，不重算对齐）
+
+把 **2～20 个按时间先后排列、互不重复**的批次作为一条时间轴，在一组**统一阈值**下
+观察每个配对的风险随批次如何演化：
+
+* **稳定配对键**：按引物**名称**构造，与各批次提交顺序无关——自二聚体保留单名
+  （如 `F`），异二聚体两名按字典序排列（如 `F|R`）；
+* **只用已保存长度重判、不重算对齐**：对每个配对仅读取其已落库的两个标量——最长
+  连续互补长度与 3′端连续互补长度，在请求给定的统一阈值下按与批次计算完全一致的
+  规则重判（3′端连续达阈值 → `high`；否则连续互补达阈值 → `medium`；否则 `low`），
+  **不重新枚举任何错位对齐**；
+* **present / absent 序列**：配对键的两端引物都在某批次中时该位置为 present
+  （风险等级由统一阈值重判），否则为 absent。引物在中间批次被删除又重新加入时，
+  序列自然出现 absent 间隔；
+* **最大连续片段压缩**：每个配对键的逐批状态被压成首尾衔接、覆盖整个时间轴的
+  **最大连续片段**，以下三类边界都会切断片段：
+  1. present / absent 翻转；
+  2. 相邻 present 批次间风险等级变化（`low < medium < high`）；
+  3. 相邻且都 present 的批次间，配对中**任一同名引物序列发生变化**
+     （在新片段上标记 `sequence_changed_at_boundary: true`；present/absent
+     翻转与序列变化同时发生时只算存在性边界）；
+* **只返回有变化的轨迹**：仅返回满足以下任一条件的配对键——发生过风险等级变化
+  （`risk_changed`）、发生过存在性变化（`presence_changed`）、存在同名引物序列
+  变化边界（`sequence_changed`）；全程 present、风险不变、序列不变的配对不返回；
+* **相邻批次汇总**：`transitions` 对每对相邻批次给出风险上升 `escalated_count`、
+  下降 `deescalated_count`、引入 `introduced_count`（前 absent 后 present）、
+  消失 `disappeared_count`（前 present 后 absent）与同名引物序列变化
+  `sequence_changed_count`（仅统计两批都存在的配对）；
+* **全程只读、确定性输出**：不新建批次、不修改任何已保存数据；轨迹按配对键
+  字典序排列，片段按批次序号排列，相同输入结果稳定可复现。任一批次不存在返回
+  `404`；批次数量越界（非 2～20）、ID 重复或为空、阈值非法（非 1～200）返回
+  `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batch-series/risk-trajectories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_ids": ["b0-uuid", "b1-uuid", "b2-uuid"],
+    "continuous_threshold": 4,
+    "three_prime_threshold": 3
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_ids` | 按时间先后排列的批次 ID，2～20 个，顺序即时间轴，不可重复、不可为空 |
+| `continuous_threshold` | 对全部批次统一生效的连续互补阈值（1～200） |
+| `three_prime_threshold` | 对全部批次统一生效的 3′端连续互补阈值（1～200） |
+
+返回示例（B0: F,R → B1: F 改序列并新增 X → B2: F 恢复、X 消失；阈值 ct=4、tt=3）：
+
+```json
+{
+  "batch_ids": ["b0-uuid", "b1-uuid", "b2-uuid"],
+  "batch_count": 3,
+  "continuous_threshold": 4,
+  "three_prime_threshold": 3,
+  "pair_key_count": 6,
+  "trajectory_count": 5,
+  "transitions": [
+    {
+      "index": 0,
+      "escalated_count": 0,
+      "deescalated_count": 0,
+      "introduced_count": 3,
+      "disappeared_count": 0,
+      "sequence_changed_count": 2
+    },
+    {
+      "index": 1,
+      "escalated_count": 0,
+      "deescalated_count": 0,
+      "introduced_count": 0,
+      "disappeared_count": 3,
+      "sequence_changed_count": 2
+    }
+  ],
+  "trajectories": [
+    {
+      "pair_key": "F",
+      "name_a": "F", "name_b": "F", "is_self_dimer": true,
+      "risk_changed": false,
+      "presence_changed": false,
+      "sequence_changed": true,
+      "segments": [
+        {"start_batch_index": 0, "end_batch_index": 0, "present": true,
+         "risk_level": "low", "sequence_changed_at_boundary": false},
+        {"start_batch_index": 1, "end_batch_index": 1, "present": true,
+         "risk_level": "low", "sequence_changed_at_boundary": true},
+        {"start_batch_index": 2, "end_batch_index": 2, "present": true,
+         "risk_level": "low", "sequence_changed_at_boundary": true}
+      ]
+    },
+    {
+      "pair_key": "X",
+      "name_a": "X", "name_b": "X", "is_self_dimer": true,
+      "risk_changed": false,
+      "presence_changed": true,
+      "sequence_changed": false,
+      "segments": [
+        {"start_batch_index": 0, "end_batch_index": 0, "present": false,
+         "risk_level": null, "sequence_changed_at_boundary": false},
+        {"start_batch_index": 1, "end_batch_index": 1, "present": true,
+         "risk_level": "high", "sequence_changed_at_boundary": false},
+        {"start_batch_index": 2, "end_batch_index": 2, "present": false,
+         "risk_level": null, "sequence_changed_at_boundary": false}
+      ]
+    }
+  ]
+}
+```
+
+* `segments` 首尾衔接、无缝覆盖 `0..batch_count-1`：第一片
+  `start_batch_index = 0`、最后一片 `end_batch_index = batch_count - 1`；
+* absent 片段的 `risk_level` 恒为 `null`，且
+  `sequence_changed_at_boundary` 恒为 `false`；
+* `pair_key_count` 为全部批次出现过的配对键并集大小，`trajectory_count`
+  为其中发生变化而返回的数量；
+* `transitions` 长度恒为 `batch_count - 1`，`index` 对应
+  `batch_ids[index] → batch_ids[index+1]`；
+* 统一阈值与各批次提交时使用的原阈值无关，可借此做跨批次的阈值敏感性
+  对比；各批次的已保存数据在请求前后完全不变。
+
 ## 配对结果字段含义
 
 | 字段 | 含义 |
@@ -837,9 +968,10 @@ app/
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
+  trajectory.py # 跨批次 present/absent 序列的最大连续片段压缩与相邻批次变化汇总
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图、批次对比与跨批次轨迹编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试
