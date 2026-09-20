@@ -7,13 +7,14 @@ import uuid
 
 from . import db
 from .augmentation import maximum_independent_set
-from .compare import PairDiff, compare_pair_risks
+from .compare import PairDiff, compare_pair_risks, pair_key
 from .dimer import PairResult, analyze_pair
 from .fragility import find_fragility
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
 from .repair import InfeasibleRepair, minimum_cost_removal
 from .threshold_map import build_threshold_map
+from .trajectory import compress_states, count_transition, rejudge_risk_level
 
 
 class ConflictRepairProtectedError(ValueError):
@@ -863,6 +864,114 @@ def build_batch_conflict_fragility_map(
         "articulation_points": articulation_points_out,
         "bridges": bridges_out,
         "intrinsic_self_risks": self_risks,
+    }
+
+
+def build_batch_series_risk_trajectories(
+    *,
+    batch_ids: list[str],
+    continuous_threshold: int,
+    three_prime_threshold: int,
+) -> dict | None:
+    """对按时间排列的批次序列在统一阈值下重判风险并压缩轨迹（纯读，不写库）。
+
+    不重算任何对齐：只取每个配对已落库的最长连续互补与 3′端连续互补两个
+    标量指标，在请求给定的统一阈值下按批次计算同款规则重判风险等级。按
+    引物名称构造稳定配对键（复用 compare.pair_key），对全部配对键的并集
+    逐批形成 present/absent 状态序列并压缩为最大连续片段；同名引物序列
+    变化强制成为片段边界并在新片段标记。仅返回发生过风险、存在性或序列
+    变化的轨迹（片段数 > 1），并汇总各相邻批次的升降、引入、消失数量。
+
+    任一批次不存在返回 None（由路由层转 404）；批次 ID 唯一性与阈值
+    合法性由请求模型与路由层保证。
+    """
+    with db.get_conn() as conn:
+        batches = [db.get_batch(conn, batch_id) for batch_id in batch_ids]
+        if any(batch is None for batch in batches):
+            return None
+        loaded = [
+            (
+                db.get_primers(conn, batch_id),
+                db.get_pairs(conn, batch_id, risky_only=False),
+            )
+            for batch_id in batch_ids
+        ]
+
+    # 每个批次：配对键 -> (重判风险等级, 涉及引物序列签名)
+    series: list[dict[tuple[str, str], tuple[str, tuple[str, ...]]]] = []
+    for primers, pairs in loaded:
+        sequence_by_name = {row["name"]: row["sequence"] for row in primers}
+        states: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {}
+        for row in pairs:
+            key = pair_key(
+                row["name_top"], row["name_bottom"], bool(row["is_self_dimer"])
+            )
+            level = rejudge_risk_level(
+                row["max_complementary_run"],
+                row["terminal_run"],
+                continuous_threshold=continuous_threshold,
+                three_prime_threshold=three_prime_threshold,
+            )
+            # 自二聚体键 (name, name) 去重为单序列签名，异二聚体按键序两序列
+            signature = tuple(sequence_by_name[name] for name in dict.fromkeys(key))
+            states[key] = (level, signature)
+        series.append(states)
+
+    all_keys = sorted({key for states in series for key in states})
+
+    trajectories: list[dict] = []
+    for key in all_keys:
+        segments = compress_states([states.get(key) for states in series])
+        if len(segments) <= 1:
+            continue  # 全程恒定（无风险、存在性或序列变化），不返回
+        name_a, name_b = key
+        trajectories.append(
+            {
+                "pair_key": name_a if name_a == name_b else f"{name_a}|{name_b}",
+                "name_a": name_a,
+                "name_b": name_b,
+                "is_self_dimer": name_a == name_b,
+                "segment_count": len(segments),
+                "segments": [
+                    {
+                        "start_index": segment.start_index,
+                        "end_index": segment.end_index,
+                        "present": segment.present,
+                        "risk_level": segment.risk_level,
+                        "sequence_changed_at_start": (
+                            segment.sequence_changed_at_start
+                        ),
+                    }
+                    for segment in segments
+                ],
+            }
+        )
+
+    transitions: list[dict] = []
+    for i in range(len(batch_ids) - 1):
+        counts = count_transition(series[i], series[i + 1])
+        transitions.append(
+            {
+                "from_index": i,
+                "to_index": i + 1,
+                "from_batch_id": batch_ids[i],
+                "to_batch_id": batch_ids[i + 1],
+                "escalated_count": counts.escalated,
+                "deescalated_count": counts.deescalated,
+                "introduced_count": counts.introduced,
+                "resolved_count": counts.resolved,
+            }
+        )
+
+    return {
+        "batch_ids": batch_ids,
+        "batch_count": len(batch_ids),
+        "continuous_threshold": continuous_threshold,
+        "three_prime_threshold": three_prime_threshold,
+        "pair_key_count": len(all_keys),
+        "changed_pair_key_count": len(trajectories),
+        "trajectories": trajectories,
+        "transitions": transitions,
     }
 
 

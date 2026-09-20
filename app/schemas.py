@@ -568,6 +568,91 @@ class ConflictRepairInfeasibleOut(BaseModel):
     )
 
 
+class RiskTrajectoryRequest(BaseModel):
+    batch_ids: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="按时间排列的 2～20 个批次 ID（不可重复）",
+    )
+    continuous_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="统一连续互补长度阈值（达到即提示结合稳定风险）",
+    )
+    three_prime_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="统一 3′端连续互补长度阈值（达到即提示延伸风险，风险等级 high）",
+    )
+
+    @field_validator("batch_ids")
+    @classmethod
+    def _batch_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            batch_id = value.strip()
+            if not batch_id:
+                raise ValueError("批次 ID 不能为空")
+            normalized.append(batch_id)
+        return normalized
+
+
+class RiskTrajectorySegmentOut(BaseModel):
+    start_index: int = Field(description="片段起始批次在请求序列中的序号（0 起，含）")
+    end_index: int = Field(description="片段结束批次在请求序列中的序号（含）")
+    present: bool = Field(description="该片段内配对是否存在于批次中")
+    risk_level: str | None = Field(
+        description="present 时统一阈值下重判的风险等级（high/medium/low）；absent 时为 null"
+    )
+    sequence_changed_at_start: bool = Field(
+        description="片段起点相对前一批次存在同名引物序列变化（首片段恒为 false）"
+    )
+
+
+class RiskTrajectoryOut(BaseModel):
+    pair_key: str = Field(
+        description="稳定配对键：自二聚体为单名，异二聚体为按名称字典序的 A|B"
+    )
+    name_a: str = Field(description="配对键第一名称（异二聚体为字典序较小者）")
+    name_b: str = Field(description="配对键第二名称（自二聚体与 name_a 相同）")
+    is_self_dimer: bool
+    segment_count: int = Field(description="最大连续片段数（≥2，恒等于 segments 长度）")
+    segments: list[RiskTrajectorySegmentOut] = Field(
+        description="按批次顺序排列的最大连续片段，相邻片段状态必不同"
+    )
+
+
+class RiskTrajectoryTransitionOut(BaseModel):
+    from_index: int = Field(description="前一批次在请求序列中的序号（0 起）")
+    to_index: int = Field(description="后一批次在请求序列中的序号")
+    from_batch_id: str
+    to_batch_id: str
+    escalated_count: int = Field(description="两批均存在且风险等级上升的配对键数")
+    deescalated_count: int = Field(description="两批均存在且风险等级下降的配对键数")
+    introduced_count: int = Field(description="前批不存在、后批存在的配对键数")
+    resolved_count: int = Field(description="前批存在、后批不存在的配对键数")
+
+
+class RiskTrajectorySeriesOut(BaseModel):
+    batch_ids: list[str] = Field(description="回显请求批次 ID 序列（按时间排列）")
+    batch_count: int
+    continuous_threshold: int = Field(description="统一连续互补阈值")
+    three_prime_threshold: int = Field(description="统一 3′端连续互补阈值")
+    pair_key_count: int = Field(description="全部批次配对键并集大小")
+    changed_pair_key_count: int = Field(
+        description="发生风险、存在性或序列变化的配对键数（恒等于 trajectories 长度）"
+    )
+    trajectories: list[RiskTrajectoryOut] = Field(
+        description="发生变化的配对键轨迹（按配对键名称字典序升序）"
+    )
+    transitions: list[RiskTrajectoryTransitionOut] = Field(
+        description="各相邻批次的变迁汇总（按批次顺序，长度恒为 batch_count - 1）"
+    )
+
+
 class ConflictFragilityMapRequest(BaseModel):
     risk_levels: list[str] = Field(
         ...,
